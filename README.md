@@ -16,7 +16,7 @@ You can interact with the model using the Streamlit interface:
 
 You can interact with the model using the Streamlit interface:
 
-![Streamlit Interface](assets/Screenshot%202025-09-03%20033640.png)
+![Streamlit Interface](Screenshot%202025-09-03%20033640.png)
 
 
 
