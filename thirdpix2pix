@@ -1,0 +1,230 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import torchvision.utils as vutils
+from PIL import Image
+import torchmetrics
+
+# =============================
+# Dataset
+# =============================
+class Sketch2PhotoDataset(Dataset):
+    def __init__(self, sketch_dir, photo_dir, transform=None):
+        self.sketch_files = sorted(os.listdir(sketch_dir))
+        self.photo_files = sorted(os.listdir(photo_dir))
+        self.sketch_dir = sketch_dir
+        self.photo_dir = photo_dir
+        self.transform = transform
+
+    def __len__(self):
+        return min(len(self.sketch_files), len(self.photo_files))
+
+    def __getitem__(self, idx):
+        sketch_path = os.path.join(self.sketch_dir, self.sketch_files[idx])
+        photo_path = os.path.join(self.photo_dir, self.photo_files[idx])
+
+        sketch = Image.open(sketch_path).convert("RGB")
+        photo = Image.open(photo_path).convert("RGB")
+
+        if self.transform:
+            sketch = self.transform(sketch)
+            photo = self.transform(photo)
+
+        return sketch, photo
+
+# =============================
+# Best UNet Generator (capacity ↑)
+# =============================
+class UNet(nn.Module):
+    def __init__(self, input_channels, output_channels, base=256):  # ↑ base to 256
+        super(UNet, self).__init__()
+
+        def down_block(in_c, out_c, normalize=True):
+            layers = [nn.Conv2d(in_c, out_c, 4, 2, 1, bias=False)]
+            if normalize:
+                layers.append(nn.BatchNorm2d(out_c))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return nn.Sequential(*layers)
+
+        def up_block(in_c, out_c, dropout=0.0):
+            layers = [nn.ConvTranspose2d(in_c, out_c, 4, 2, 1, bias=False),
+                      nn.BatchNorm2d(out_c),
+                      nn.ReLU(inplace=True)]
+            if dropout:
+                layers.append(nn.Dropout(dropout))
+            return nn.Sequential(*layers)
+
+        # Encoder
+        self.down1 = down_block(input_channels, base, normalize=False)
+        self.down2 = down_block(base, base*2)
+        self.down3 = down_block(base*2, base*4)
+        self.down4 = down_block(base*4, base*8)
+        self.down5 = down_block(base*8, base*8)
+        self.down6 = down_block(base*8, base*8)
+        self.down7 = down_block(base*8, base*8)
+        self.down8 = down_block(base*8, base*8, normalize=False)
+
+        # Decoder
+        self.up1 = up_block(base*8, base*8, dropout=0.5)
+        self.up2 = up_block(base*16, base*8, dropout=0.5)
+        self.up3 = up_block(base*16, base*8, dropout=0.5)
+        self.up4 = up_block(base*16, base*8)
+        self.up5 = up_block(base*16, base*4)
+        self.up6 = up_block(base*8, base*2)
+        self.up7 = up_block(base*4, base)
+        self.up8 = nn.Sequential(
+            nn.ConvTranspose2d(base*2, output_channels, 4, 2, 1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+        d6 = self.down6(d5)
+        d7 = self.down7(d6)
+        d8 = self.down8(d7)
+
+        u1 = self.up1(d8)
+        u2 = self.up2(torch.cat([u1, d7], 1))
+        u3 = self.up3(torch.cat([u2, d6], 1))
+        u4 = self.up4(torch.cat([u3, d5], 1))
+        u5 = self.up5(torch.cat([u4, d4], 1))
+        u6 = self.up6(torch.cat([u5, d3], 1))
+        u7 = self.up7(torch.cat([u6, d2], 1))
+        u8 = self.up8(torch.cat([u7, d1], 1))
+
+        return u8
+
+# =============================
+# Discriminator (PatchGAN)
+# =============================
+class Discriminator(nn.Module):
+    def __init__(self, input_channels):
+        super(Discriminator, self).__init__()
+
+        def block(in_c, out_c, normalize=True):
+            layers = [nn.Conv2d(in_c, out_c, 4, 2, 1, bias=False)]
+            if normalize:
+                layers.append(nn.BatchNorm2d(out_c))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(
+            *block(input_channels*2, 64, normalize=False),
+            *block(64, 128),
+            *block(128, 256),
+            *block(256, 512),
+            nn.Conv2d(512, 1, 4, 1, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, y):
+        inp = torch.cat([x, y], 1)
+        return self.model(inp)
+
+# =============================
+# Training Config
+# =============================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_dim = 3
+real_dim = 3
+n_epochs = 100
+batch_size = 8  # ↓ for memory
+lr = 2e-4
+lambda_L1 = 100
+
+# Metrics
+psnr = torchmetrics.image.PeakSignalNoiseRatio().to(device)
+ssim = torchmetrics.image.StructuralSimilarityIndexMeasure().to(device)
+
+# =============================
+# Transforms
+# =============================
+transform = transforms.Compose([
+    transforms.Resize((256,256)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+# =============================
+# Dataset & Loader
+# =============================
+train_dataset = Sketch2PhotoDataset("train\photos", "train\sketches", transform=transform)
+val_dataset   = Sketch2PhotoDataset("val\photos", "val\sketches", transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False)
+
+# =============================
+# Model Init
+# =============================
+gen = UNet(input_dim, real_dim).to(device)
+disc = Discriminator(input_dim).to(device)
+criterion_GAN = nn.BCELoss()
+criterion_L1 = nn.L1Loss()
+
+opt_G = optim.Adam(gen.parameters(), lr=lr, betas=(0.5,0.999))
+opt_D = optim.Adam(disc.parameters(), lr=lr, betas=(0.5,0.999))
+
+# =============================
+# Training Loop
+# =============================
+for epoch in range(1, n_epochs+1):
+    gen.train()
+    for sketches, photos in train_loader:
+        sketches, photos = sketches.to(device), photos.to(device)
+
+        # Train D
+        opt_D.zero_grad()
+        fake_photos = gen(sketches)
+        pred_real = disc(sketches, photos)
+        pred_fake = disc(sketches, fake_photos.detach())
+        loss_D = (criterion_GAN(pred_real, torch.ones_like(pred_real)) +
+                  criterion_GAN(pred_fake, torch.zeros_like(pred_fake))) * 0.5
+        loss_D.backward()
+        opt_D.step()
+
+        # Train G
+        opt_G.zero_grad()
+        pred_fake = disc(sketches, fake_photos)
+        loss_GAN = criterion_GAN(pred_fake, torch.ones_like(pred_fake))
+        loss_L1 = criterion_L1(fake_photos, photos) * lambda_L1
+        loss_G = loss_GAN + loss_L1
+        loss_G.backward()
+        opt_G.step()
+
+    # =============================
+    # Validation every 10 epochs
+    # =============================
+    if True:
+        gen.eval()
+        val_psnr, val_ssim, count = 0.0, 0.0, 0
+        with torch.no_grad():
+            for v_sketch, v_photo in val_loader:
+                v_sketch, v_photo = v_sketch.to(device), v_photo.to(device)
+                v_fake = gen(v_sketch)
+                val_psnr += psnr(v_fake, v_photo).item()
+                val_ssim += ssim(v_fake, v_photo).item()
+                count += 1
+        print(f"Epoch [{epoch}/{n_epochs}] | Gen Loss: {loss_G.item():.4f} | Disc Loss: {loss_D.item():.4f} "
+              f"| Val PSNR: {val_psnr/count:.2f} | Val SSIM: {val_ssim/count:.4f}")
+
+        # Save generator model
+        torch.save(gen.state_dict(), f"gen_epoch.pth")
+
+    # =============================
+    # Save example outputs every 25 epochs
+    # =============================
+    if epoch % 25 == 0:
+        gen.eval()
+        with torch.no_grad():
+            v_sketch, v_photo = next(iter(val_loader))
+            v_sketch, v_photo = v_sketch.to(device), v_photo.to(device)
+            v_fake = gen(v_sketch)
+            vutils.save_image(torch.cat([v_sketch, v_photo, v_fake], 0),
+                              f"val_sample_epoch{epoch}.png", normalize=True, nrow=3)
