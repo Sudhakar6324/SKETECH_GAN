@@ -12,7 +12,12 @@ This project implements a GAN-based approach for sketch generation using a **U-N
 
 You can interact with the model using the Streamlit interface:
 
-![Streamlit Interface](assets/Screenshot 2025-09-03 033640.png)
+![Streamlit Interface](assets/## Interface
+
+You can interact with the model using the Streamlit interface:
+
+![Streamlit Interface](assets/interface_screenshot.png)
+
 
 ## Installation
 
